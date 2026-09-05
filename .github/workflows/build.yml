@@ -1,0 +1,92 @@
+name: Build iOS IPA
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - master
+      - main
+
+concurrency:
+  group: ios-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: macos-26
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Select project Xcode version
+        shell: bash
+        run: |
+          set -euo pipefail
+          XCODE_VERSION="$(python3 -c 'import json; print(json.load(open("versions.json"))["xcode"])')"
+          XCODE_PATH="/Applications/Xcode_${XCODE_VERSION}.app/Contents/Developer"
+          test -d "$XCODE_PATH"
+          sudo xcode-select -s "$XCODE_PATH"
+          xcodebuild -version
+
+      - name: Validate build secrets
+        env:
+          TG_API_ID: ${{ secrets.TG_API_ID }}
+          TG_API_HASH: ${{ secrets.TG_API_HASH }}
+          TG_BUNDLE_ID: ${{ secrets.TG_BUNDLE_ID }}
+          TG_TEAM_ID: ${{ secrets.TG_TEAM_ID }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          for name in TG_API_ID TG_API_HASH TG_BUNDLE_ID TG_TEAM_ID; do
+            test -n "${!name:-}" || { echo "Missing GitHub secret: $name"; exit 1; }
+          done
+
+      - name: Create build configuration
+        env:
+          TG_API_ID: ${{ secrets.TG_API_ID }}
+          TG_API_HASH: ${{ secrets.TG_API_HASH }}
+          TG_BUNDLE_ID: ${{ secrets.TG_BUNDLE_ID }}
+          TG_TEAM_ID: ${{ secrets.TG_TEAM_ID }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          jq \
+            --arg bundle_id "$TG_BUNDLE_ID" \
+            --arg api_id "$TG_API_ID" \
+            --arg api_hash "$TG_API_HASH" \
+            --arg team_id "$TG_TEAM_ID" \
+            '.bundle_id = $bundle_id | .api_id = $api_id | .api_hash = $api_hash | .team_id = $team_id | .is_internal_build = "true" | .is_appstore_build = "false" | .enable_siri = false | .enable_icloud = false' \
+            build-system/template_minimal_development_configuration.json > build-system/ci-configuration.json
+
+      - name: Build IPA
+        shell: bash
+        run: |
+          set -euo pipefail
+          BUILD_NUMBER="$(( $(git rev-list --count HEAD) + $(cat build_number_offset) ))"
+          python3 build-system/Make/ImportCertificates.py --path build-system/fake-codesigning/certs
+          python3 -u build-system/Make/Make.py \
+            --overrideXcodeVersion \
+            --bazelUserRoot=/private/var/tmp/_bazel_ghostgram \
+            --cacheDir="$RUNNER_TEMP/telegram-bazel-cache" \
+            build \
+            --configurationPath=build-system/ci-configuration.json \
+            --codesigningInformationPath=build-system/fake-codesigning \
+            --configuration=release_arm64 \
+            --buildNumber="$BUILD_NUMBER" \
+            --outputBuildArtifactsPath="$GITHUB_WORKSPACE/build/artifacts"
+          IPA_PATH="$(find build/artifacts -name '*.ipa' -type f | head -1)"
+          test -n "$IPA_PATH"
+          cp "$IPA_PATH" build/artifacts/Ghostgram.ipa
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: Ghostgram-${{ github.sha }}
+          path: build/artifacts/Ghostgram.ipa
+          if-no-files-found: error
+          retention-days: 14
